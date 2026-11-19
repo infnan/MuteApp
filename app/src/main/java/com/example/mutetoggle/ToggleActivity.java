@@ -24,13 +24,16 @@ public final class ToggleActivity extends Activity {
     private static final String POLICY_ACCESS_REQUESTED = "policy_access_requested";
     private static final long SETTLE_DELAY_MS = 250;
     private static final long CONFIRM_TIMEOUT_MS = 2000;
-    private static final long VIBRATION_MS = 500;
+    private static final long VIBRATION_MS = 300;
+    private static final long RECOVERY_SOUND_DELAY_MS = 100;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private MuteController controller;
     private RecoverySound recoverySound;
     private RuntimeException commandFailure;
     private long confirmationDeadline;
+    private boolean soundComplete;
+    private boolean recoveryComplete;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -56,9 +59,16 @@ public final class ToggleActivity extends Activity {
             try {
                 controller.setRingerMode(target);
             } catch (RuntimeException exception) {
-                Log.w(TAG, "Ringer command reported an error; checking actual state", exception);
+                Log.w(TAG, "Ringer command reported an error", exception);
                 commandFailure = exception;
             }
+            if (target == AudioManager.RINGER_MODE_SILENT) {
+                show(R.string.mute_enabled);
+                vibrateConfirmation();
+                handler.postDelayed(this::finish, VIBRATION_MS);
+                return;
+            }
+            handler.postDelayed(this::startRecoverySound, RECOVERY_SOUND_DELAY_MS);
             confirmationDeadline = SystemClock.uptimeMillis() + CONFIRM_TIMEOUT_MS;
             handler.postDelayed(() -> verifyToggle(target), SETTLE_DELAY_MS);
         } catch (RuntimeException exception) {
@@ -106,14 +116,8 @@ public final class ToggleActivity extends Activity {
             Log.w(TAG, "Cannot confirm ringer mode yet", exception);
         }
         if (confirmed) {
-            if (target == AudioManager.RINGER_MODE_SILENT) {
-                show(R.string.mute_enabled);
-                vibrateConfirmation();
-                handler.postDelayed(this::finish, VIBRATION_MS);
-            } else {
-                controller.recoverZeroVolumes();
-                handler.postDelayed(this::retryVolumeRecovery, SETTLE_DELAY_MS);
-            }
+            controller.recoverZeroVolumes();
+            handler.postDelayed(this::retryVolumeRecovery, SETTLE_DELAY_MS);
         } else if (SystemClock.uptimeMillis() < confirmationDeadline) {
             handler.postDelayed(() -> verifyToggle(target), SETTLE_DELAY_MS);
         } else if (commandFailure instanceof SecurityException) {
@@ -155,18 +159,26 @@ public final class ToggleActivity extends Activity {
         handler.postDelayed(this::finishRecovery, SETTLE_DELAY_MS);
     }
 
+    private void startRecoverySound() {
+        recoverySound = new RecoverySound(() -> {
+            soundComplete = true;
+            if (recoveryComplete) {
+                finish();
+            }
+        }, () -> show(R.string.sound_failed));
+        recoverySound.play();
+    }
+
     private void finishRecovery() {
         if (!isStillNormal()) {
             return;
         }
         boolean volumeWarning = !controller.areVolumesRecovered();
         show(volumeWarning ? R.string.volume_failed : R.string.mute_disabled);
-        recoverySound = new RecoverySound(getApplicationContext(), this::finish, () -> {
-            if (!volumeWarning) {
-                show(R.string.sound_failed);
-            }
-        });
-        recoverySound.play();
+        recoveryComplete = true;
+        if (soundComplete) {
+            finish();
+        }
     }
 
     private boolean isStillNormal() {

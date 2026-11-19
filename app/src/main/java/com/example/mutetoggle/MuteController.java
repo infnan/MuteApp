@@ -11,12 +11,7 @@ final class MuteController {
     private static final String TAG = "MuteToggle";
     private static final int RECOVERY_VOLUME = 3;
     private static final int[] VOLUME_STREAMS = {
-            AudioManager.STREAM_RING,
-            AudioManager.STREAM_NOTIFICATION,
-            AudioManager.STREAM_MUSIC,
-            AudioManager.STREAM_ALARM,
-            AudioManager.STREAM_VOICE_CALL,
-            AudioManager.STREAM_SYSTEM
+            AudioManager.STREAM_VOICE_CALL
     };
 
     private final AudioManager audio;
