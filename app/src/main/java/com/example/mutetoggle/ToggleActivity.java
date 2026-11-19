@@ -4,17 +4,16 @@ import android.app.Activity;
 import android.app.NotificationManager;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
-import android.media.Ringtone;
-import android.media.RingtoneManager;
-import android.media.ToneGenerator;
-import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.WindowManager;
@@ -22,15 +21,16 @@ import android.widget.Toast;
 
 public final class ToggleActivity extends Activity {
     private static final String TAG = "MuteToggle";
+    private static final String POLICY_ACCESS_REQUESTED = "policy_access_requested";
     private static final long SETTLE_DELAY_MS = 250;
-    private static final long MAX_SOUND_MS = 2000;
+    private static final long CONFIRM_TIMEOUT_MS = 2000;
+    private static final long VIBRATION_MS = 500;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private MuteController controller;
-    private Ringtone ringtone;
-    private ToneGenerator fallbackTone;
-    private long soundStartedAt;
-    private boolean volumeWarning;
+    private RecoverySound recoverySound;
+    private RuntimeException commandFailure;
+    private long confirmationDeadline;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -50,18 +50,17 @@ public final class ToggleActivity extends Activity {
             showAndFinish(R.string.fixed_volume);
             return;
         }
-        NotificationManager notifications = getSystemService(NotificationManager.class);
-        if (notifications == null || !notifications.isNotificationPolicyAccessGranted()) {
-            requestPolicyAccess();
-            return;
-        }
-        controller = new MuteController(audio);
+        controller = new MuteController(audio, getApplicationContext());
         try {
-            int target = controller.toggle();
+            int target = controller.getTargetRingerMode();
+            try {
+                controller.setRingerMode(target);
+            } catch (RuntimeException exception) {
+                Log.w(TAG, "Ringer command reported an error; checking actual state", exception);
+                commandFailure = exception;
+            }
+            confirmationDeadline = SystemClock.uptimeMillis() + CONFIRM_TIMEOUT_MS;
             handler.postDelayed(() -> verifyToggle(target), SETTLE_DELAY_MS);
-        } catch (SecurityException exception) {
-            Log.w(TAG, "Ringer permission denied", exception);
-            requestPolicyAccess();
         } catch (RuntimeException exception) {
             fail(exception);
         }
@@ -73,7 +72,22 @@ public final class ToggleActivity extends Activity {
         setIntent(intent);
     }
 
-    private void requestPolicyAccess() {
+    private void requestPolicyAccessOnce() {
+        NotificationManager notifications = getSystemService(NotificationManager.class);
+        try {
+            if (notifications != null && notifications.isNotificationPolicyAccessGranted()) {
+                showAndFinish(R.string.toggle_failed);
+                return;
+            }
+        } catch (RuntimeException exception) {
+            Log.w(TAG, "Cannot query policy permission", exception);
+        }
+        SharedPreferences preferences = getPreferences(MODE_PRIVATE);
+        if (preferences.getBoolean(POLICY_ACCESS_REQUESTED, false)) {
+            showAndFinish(R.string.permission_denied);
+            return;
+        }
+        preferences.edit().putBoolean(POLICY_ACCESS_REQUESTED, true).apply();
         try {
             startActivity(new Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS));
             show(R.string.permission_required);
@@ -85,113 +99,86 @@ public final class ToggleActivity extends Activity {
     }
 
     private void verifyToggle(int target) {
+        boolean confirmed = false;
         try {
-            if (!controller.hasRingerMode(target)) {
-                showAndFinish(R.string.toggle_failed);
-            } else if (target == AudioManager.RINGER_MODE_SILENT) {
-                showAndFinish(R.string.mute_enabled);
+            confirmed = controller.hasRingerMode(target);
+        } catch (RuntimeException exception) {
+            Log.w(TAG, "Cannot confirm ringer mode yet", exception);
+        }
+        if (confirmed) {
+            if (target == AudioManager.RINGER_MODE_SILENT) {
+                show(R.string.mute_enabled);
+                vibrateConfirmation();
+                handler.postDelayed(this::finish, VIBRATION_MS);
             } else {
                 controller.recoverZeroVolumes();
                 handler.postDelayed(this::retryVolumeRecovery, SETTLE_DELAY_MS);
             }
+        } else if (SystemClock.uptimeMillis() < confirmationDeadline) {
+            handler.postDelayed(() -> verifyToggle(target), SETTLE_DELAY_MS);
+        } else if (commandFailure instanceof SecurityException) {
+            requestPolicyAccessOnce();
+        } else if (commandFailure != null) {
+            fail(commandFailure);
+        } else {
+            Log.w(TAG, "Ringer command returned normally but state was not confirmed: " + target);
+            showAndFinish(R.string.toggle_unconfirmed);
+        }
+    }
+
+    private void vibrateConfirmation() {
+        try {
+            Vibrator vibrator = getSystemService(Vibrator.class);
+            if (vibrator == null || !vibrator.hasVibrator()) {
+                Log.w(TAG, "Vibrator unavailable");
+                return;
+            }
+            AudioAttributes attributes = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                    .build();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(VibrationEffect.createOneShot(
+                        VIBRATION_MS, VibrationEffect.DEFAULT_AMPLITUDE), attributes);
+            } else {
+                vibrator.vibrate(VIBRATION_MS, attributes);
+            }
         } catch (RuntimeException exception) {
-            fail(exception);
+            Log.w(TAG, "Mute succeeded but confirmation vibration failed", exception);
         }
     }
 
     private void retryVolumeRecovery() {
-        try {
-            if (!controller.hasRingerMode(AudioManager.RINGER_MODE_NORMAL)) {
-                showAndFinish(R.string.toggle_failed);
-                return;
-            }
-            controller.recoverZeroVolumes();
-            handler.postDelayed(this::finishRecovery, SETTLE_DELAY_MS);
-        } catch (RuntimeException exception) {
-            fail(exception);
+        if (!isStillNormal()) {
+            return;
         }
+        controller.recoverZeroVolumes();
+        handler.postDelayed(this::finishRecovery, SETTLE_DELAY_MS);
     }
 
     private void finishRecovery() {
-        try {
-            if (!controller.hasRingerMode(AudioManager.RINGER_MODE_NORMAL)) {
-                showAndFinish(R.string.toggle_failed);
-                return;
-            }
-            volumeWarning = !controller.areVolumesRecovered();
-            show(volumeWarning ? R.string.volume_failed : R.string.mute_disabled);
-            playSystemSound();
-        } catch (RuntimeException exception) {
-            fail(exception);
+        if (!isStillNormal()) {
+            return;
         }
-    }
-
-    private void playSystemSound() {
-        int[] defaults = {
-                RingtoneManager.TYPE_NOTIFICATION,
-                RingtoneManager.TYPE_RINGTONE,
-                RingtoneManager.TYPE_ALARM
-        };
-        for (int type : defaults) {
-            try {
-                if (RingtoneManager.getActualDefaultRingtoneUri(this, type) == null) {
-                    continue;
-                }
-                Uri uri = RingtoneManager.getDefaultUri(type);
-                ringtone = RingtoneManager.getRingtone(getApplicationContext(), uri);
-                if (ringtone == null) {
-                    continue;
-                }
-                ringtone.setAudioAttributes(new AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_NOTIFICATION)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                        .build());
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    ringtone.setLooping(false);
-                }
-                soundStartedAt = SystemClock.uptimeMillis();
-                ringtone.play();
-                handler.postDelayed(this::checkSound, 200);
-                return;
-            } catch (RuntimeException exception) {
-                Log.w(TAG, "Default sound unavailable: " + type, exception);
-                stopSound();
-            }
-        }
-        playFallbackTone();
-    }
-
-    private void checkSound() {
-        try {
-            if (ringtone == null || !ringtone.isPlaying()) {
-                finish();
-            } else if (SystemClock.uptimeMillis() - soundStartedAt >= MAX_SOUND_MS) {
-                stopSound();
-                finish();
-            } else {
-                handler.postDelayed(this::checkSound, 150);
-            }
-        } catch (RuntimeException exception) {
-            Log.w(TAG, "Cannot monitor system sound", exception);
-            stopSound();
-            playFallbackTone();
-        }
-    }
-
-    private void playFallbackTone() {
-        try {
-            fallbackTone = new ToneGenerator(AudioManager.STREAM_NOTIFICATION, 80);
-            if (!fallbackTone.startTone(ToneGenerator.TONE_PROP_ACK, 200)) {
-                throw new IllegalStateException("System tone rejected");
-            }
-            handler.postDelayed(this::finish, 350);
-        } catch (RuntimeException exception) {
-            Log.w(TAG, "Cannot play fallback tone", exception);
+        boolean volumeWarning = !controller.areVolumesRecovered();
+        show(volumeWarning ? R.string.volume_failed : R.string.mute_disabled);
+        recoverySound = new RecoverySound(getApplicationContext(), this::finish, () -> {
             if (!volumeWarning) {
                 show(R.string.sound_failed);
             }
-            finish();
+        });
+        recoverySound.play();
+    }
+
+    private boolean isStillNormal() {
+        try {
+            if (controller.hasRingerMode(AudioManager.RINGER_MODE_NORMAL)) {
+                return true;
+            }
+        } catch (RuntimeException exception) {
+            Log.w(TAG, "Cannot recheck normal mode", exception);
         }
+        showAndFinish(R.string.toggle_unconfirmed);
+        return false;
     }
 
     private void show(int message) {
@@ -208,25 +195,12 @@ public final class ToggleActivity extends Activity {
         showAndFinish(R.string.toggle_failed);
     }
 
-    private void stopSound() {
-        if (ringtone != null) {
-            try {
-                ringtone.stop();
-            } catch (RuntimeException exception) {
-                Log.w(TAG, "Cannot stop system sound", exception);
-            }
-            ringtone = null;
-        }
-        if (fallbackTone != null) {
-            fallbackTone.release();
-            fallbackTone = null;
-        }
-    }
-
     @Override
     protected void onDestroy() {
         handler.removeCallbacksAndMessages(null);
-        stopSound();
+        if (recoverySound != null) {
+            recoverySound.stop();
+        }
         super.onDestroy();
     }
 }
