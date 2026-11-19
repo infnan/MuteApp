@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">静音开关</string>
+    <string name="mute_enabled">已开启静音</string>
+    <string name="mute_disabled">已关闭静音</string>
+    <string name="permission_required">请允许“静音开关”的勿扰模式访问权限，再次启动即可切换</string>
+    <string name="permission_unavailable">无法打开授权设置，请在系统设置中允许“静音开关”的勿扰模式访问权限</string>
+    <string name="toggle_failed">静音切换失败，请检查系统权限或设备限制</string>
+    <string name="volume_failed">已关闭静音，但部分音量未能恢复，请检查系统音量</string>
+    <string name="sound_failed">已关闭静音，但系统提示音未能播放</string>
+    <string name="audio_unavailable">此设备未提供音频管理服务</string>
+    <string name="fixed_volume">设备限制了音量调节，无法切换静音</string>
+</resources>
